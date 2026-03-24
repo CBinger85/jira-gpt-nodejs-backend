@@ -1,5 +1,5 @@
 {
-  "name": "jira-gpt-backend",
+  "name": "jira-gpt-nodejs-backend",
   "version": "1.0.0",
   "type": "module",
   "main": "server.js",
