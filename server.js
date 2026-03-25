@@ -7,7 +7,7 @@ dotenv.config();
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: "5mb" }));
 
 const {
   PORT = 3000,
@@ -31,7 +31,8 @@ const jiraClient = axios.create({
     Accept: "application/json",
     "Content-Type": "application/json"
   },
-  timeout: 30000
+  timeout: 30000,
+  validateStatus: () => true
 });
 
 function unauthorized(res) {
@@ -79,11 +80,13 @@ function buildPlainTextAdf(text) {
   };
 }
 
+function isPlainObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
 function isValidAdfDocument(value) {
   return (
-    value &&
-    typeof value === "object" &&
-    !Array.isArray(value) &&
+    isPlainObject(value) &&
     value.type === "doc" &&
     value.version === 1 &&
     Array.isArray(value.content)
@@ -129,8 +132,12 @@ function extractPlainTextFromAdf(adf) {
       parts.push(node.text);
     }
 
-    if (node.type === "emoji" && node.attrs?.text) {
-      parts.push(node.attrs.text);
+    if (node.type === "emoji") {
+      if (node.attrs?.text) {
+        parts.push(node.attrs.text);
+      } else if (node.attrs?.shortName) {
+        parts.push(node.attrs.shortName);
+      }
     }
 
     if (node.content) {
@@ -143,15 +150,31 @@ function extractPlainTextFromAdf(adf) {
   return parts.length > 0 ? parts.join(" ") : null;
 }
 
-function logJiraError(context, error) {
-  const jiraStatus = error.response?.status;
-  const jiraData = error.response?.data;
+function logPayload(label, payload) {
+  try {
+    console.log(`${label}:`, JSON.stringify(payload, null, 2));
+  } catch (error) {
+    console.log(`${label}: [payload konnte nicht serialisiert werden]`, error.message);
+  }
+}
 
-  console.error(`${context} status:`, jiraStatus || "n/a");
+function handleJiraResponse(res, operationName, jiraResponse, successPayload) {
+  if (jiraResponse.status >= 200 && jiraResponse.status < 300) {
+    return res.json(successPayload);
+  }
+
+  console.error(`${operationName} status:`, jiraResponse.status);
   console.error(
-    `${context} details:`,
-    JSON.stringify(jiraData || { message: error.message }, null, 2)
+    `${operationName} response:`,
+    JSON.stringify(jiraResponse.data, null, 2)
   );
+
+  return res.status(500).json({
+    success: false,
+    error: `${operationName} fehlgeschlagen`,
+    jiraStatus: jiraResponse.status,
+    jiraDetails: jiraResponse.data
+  });
 }
 
 app.get("/health", (_req, res) => {
@@ -194,14 +217,14 @@ app.post("/create-jira-issue", async (req, res) => {
     }
 
     const fields = {
-      project: { key: projectKey },
-      issuetype: { name: issueType },
+      project: { key: String(projectKey) },
+      issuetype: { name: String(issueType) },
       summary: String(summary),
       description: normalizedDescription
     };
 
     if (priority) {
-      fields.priority = { name: priority };
+      fields.priority = { name: String(priority) };
     }
 
     if (Array.isArray(labels) && labels.length > 0) {
@@ -213,39 +236,47 @@ app.post("/create-jira-issue", async (req, res) => {
     }
 
     const payload = { fields };
-
-    console.log(
-      "create-jira-issue payload:",
-      JSON.stringify(payload, null, 2)
-    );
+    logPayload("create-jira-issue payload", payload);
 
     const jiraResponse = await jiraClient.post("/issue", payload);
 
-    const issueId = jiraResponse.data.id;
-    const issueKey = jiraResponse.data.key;
-    const browseUrl = `${JIRA_BASE_URL}/browse/${issueKey}`;
+    if (jiraResponse.status >= 200 && jiraResponse.status < 300) {
+      const issueId = jiraResponse.data.id;
+      const issueKey = jiraResponse.data.key;
+      const browseUrl = `${JIRA_BASE_URL}/browse/${issueKey}`;
 
-    return res.json({
-      success: true,
-      issueId,
-      issueKey,
-      browseUrl
-    });
-  } catch (error) {
-    if (error.message?.includes("ADF-Dokument")) {
-      return res.status(400).json({
-        success: false,
-        error: error.message
+      return res.json({
+        success: true,
+        issueId,
+        issueKey,
+        browseUrl
       });
     }
 
-    logJiraError("Jira create issue error", error);
+    console.error("create-jira-issue status:", jiraResponse.status);
+    console.error(
+      "create-jira-issue response:",
+      JSON.stringify(jiraResponse.data, null, 2)
+    );
 
     return res.status(500).json({
       success: false,
       error: "Jira-Ticket konnte nicht erstellt werden",
-      jiraStatus: error.response?.status,
-      jiraDetails: error.response?.data || error.message
+      jiraStatus: jiraResponse.status,
+      jiraDetails: jiraResponse.data
+    });
+  } catch (error) {
+    console.error("create-jira-issue exception:", error.message);
+
+    return res.status(
+      error.message?.includes("ADF-Dokument") ? 400 : 500
+    ).json({
+      success: false,
+      error:
+        error.message?.includes("ADF-Dokument")
+          ? error.message
+          : "Jira-Ticket konnte nicht erstellt werden",
+      jiraDetails: error.message
     });
   }
 });
@@ -265,7 +296,23 @@ app.get("/jira-issue/:issueKey", async (req, res) => {
       });
     }
 
-    const jiraResponse = await jiraClient.get(`/issue/${issueKey}`);
+    const jiraResponse = await jiraClient.get(`/issue/${encodeURIComponent(issueKey)}`);
+
+    if (!(jiraResponse.status >= 200 && jiraResponse.status < 300)) {
+      console.error("get-jira-issue status:", jiraResponse.status);
+      console.error(
+        "get-jira-issue response:",
+        JSON.stringify(jiraResponse.data, null, 2)
+      );
+
+      return res.status(500).json({
+        success: false,
+        error: "Jira-Ticket konnte nicht geladen werden",
+        jiraStatus: jiraResponse.status,
+        jiraDetails: jiraResponse.data
+      });
+    }
+
     const issue = jiraResponse.data;
 
     return res.json({
@@ -288,13 +335,12 @@ app.get("/jira-issue/:issueKey", async (req, res) => {
       browseUrl: `${JIRA_BASE_URL}/browse/${issue.key}`
     });
   } catch (error) {
-    logJiraError("Jira get issue error", error);
+    console.error("get-jira-issue exception:", error.message);
 
     return res.status(500).json({
       success: false,
       error: "Jira-Ticket konnte nicht geladen werden",
-      jiraStatus: error.response?.status,
-      jiraDetails: error.response?.data || error.message
+      jiraDetails: error.message
     });
   }
 });
@@ -332,7 +378,7 @@ app.post("/update-jira-issue", async (req, res) => {
     }
 
     if (priority) {
-      fields.priority = { name: priority };
+      fields.priority = { name: String(priority) };
     }
 
     if (Array.isArray(labels)) {
@@ -351,34 +397,45 @@ app.post("/update-jira-issue", async (req, res) => {
     }
 
     const payload = { fields };
+    logPayload("update-jira-issue payload", payload);
 
-    console.log(
-      "update-jira-issue payload:",
-      JSON.stringify(payload, null, 2)
+    const jiraResponse = await jiraClient.put(
+      `/issue/${encodeURIComponent(issueKey)}`,
+      payload
     );
 
-    await jiraClient.put(`/issue/${issueKey}`, payload);
-
-    return res.json({
-      success: true,
-      issueKey,
-      browseUrl: `${JIRA_BASE_URL}/browse/${issueKey}`
-    });
-  } catch (error) {
-    if (error.message?.includes("ADF-Dokument")) {
-      return res.status(400).json({
-        success: false,
-        error: error.message
+    if (jiraResponse.status >= 200 && jiraResponse.status < 300) {
+      return res.json({
+        success: true,
+        issueKey,
+        browseUrl: `${JIRA_BASE_URL}/browse/${issueKey}`
       });
     }
 
-    logJiraError("Jira update issue error", error);
+    console.error("update-jira-issue status:", jiraResponse.status);
+    console.error(
+      "update-jira-issue response:",
+      JSON.stringify(jiraResponse.data, null, 2)
+    );
 
     return res.status(500).json({
       success: false,
       error: "Jira-Ticket konnte nicht aktualisiert werden",
-      jiraStatus: error.response?.status,
-      jiraDetails: error.response?.data || error.message
+      jiraStatus: jiraResponse.status,
+      jiraDetails: jiraResponse.data
+    });
+  } catch (error) {
+    console.error("update-jira-issue exception:", error.message);
+
+    return res.status(
+      error.message?.includes("ADF-Dokument") ? 400 : 500
+    ).json({
+      success: false,
+      error:
+        error.message?.includes("ADF-Dokument")
+          ? error.message
+          : "Jira-Ticket konnte nicht aktualisiert werden",
+      jiraDetails: error.message
     });
   }
 });
@@ -411,40 +468,48 @@ app.post("/add-jira-comment", async (req, res) => {
       body: normalizedComment
     };
 
-    console.log(
-      "add-jira-comment payload:",
-      JSON.stringify(
-        {
-          issueKey,
-          ...payload
-        },
-        null,
-        2
-      )
+    logPayload("add-jira-comment payload", {
+      issueKey,
+      ...payload
+    });
+
+    const jiraResponse = await jiraClient.post(
+      `/issue/${encodeURIComponent(issueKey)}/comment`,
+      payload
     );
 
-    await jiraClient.post(`/issue/${issueKey}/comment`, payload);
-
-    return res.json({
-      success: true,
-      issueKey,
-      browseUrl: `${JIRA_BASE_URL}/browse/${issueKey}`
-    });
-  } catch (error) {
-    if (error.message?.includes("ADF-Dokument")) {
-      return res.status(400).json({
-        success: false,
-        error: error.message
+    if (jiraResponse.status >= 200 && jiraResponse.status < 300) {
+      return res.json({
+        success: true,
+        issueKey,
+        browseUrl: `${JIRA_BASE_URL}/browse/${issueKey}`
       });
     }
 
-    logJiraError("Jira add comment error", error);
+    console.error("add-jira-comment status:", jiraResponse.status);
+    console.error(
+      "add-jira-comment response:",
+      JSON.stringify(jiraResponse.data, null, 2)
+    );
 
     return res.status(500).json({
       success: false,
       error: "Kommentar konnte nicht hinzugefügt werden",
-      jiraStatus: error.response?.status,
-      jiraDetails: error.response?.data || error.message
+      jiraStatus: jiraResponse.status,
+      jiraDetails: jiraResponse.data
+    });
+  } catch (error) {
+    console.error("add-jira-comment exception:", error.message);
+
+    return res.status(
+      error.message?.includes("ADF-Dokument") ? 400 : 500
+    ).json({
+      success: false,
+      error:
+        error.message?.includes("ADF-Dokument")
+          ? error.message
+          : "Kommentar konnte nicht hinzugefügt werden",
+      jiraDetails: error.message
     });
   }
 });
