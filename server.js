@@ -27,8 +27,8 @@ const jiraAuth = Buffer.from(`${JIRA_EMAIL}:${JIRA_API_TOKEN}`).toString("base64
 const jiraClient = axios.create({
   baseURL: `${JIRA_BASE_URL}/rest/api/3`,
   headers: {
-    "Authorization": `Basic ${jiraAuth}`,
-    "Accept": "application/json",
+    Authorization: `Basic ${jiraAuth}`,
+    Accept: "application/json",
     "Content-Type": "application/json"
   },
   timeout: 30000
@@ -41,6 +41,22 @@ function unauthorized(res) {
   });
 }
 
+function checkBackendAuth(req, res) {
+  if (!BACKEND_API_KEY) {
+    return true;
+  }
+
+  const authHeader = req.headers.authorization || "";
+  const expected = `Bearer ${BACKEND_API_KEY}`;
+
+  if (authHeader !== expected) {
+    unauthorized(res);
+    return false;
+  }
+
+  return true;
+}
+
 function buildAdfDescription(text) {
   return {
     type: "doc",
@@ -51,12 +67,43 @@ function buildAdfDescription(text) {
         content: [
           {
             type: "text",
-            text: text
+            text: String(text)
           }
         ]
       }
     ]
   };
+}
+
+function extractPlainTextFromAdf(adf) {
+  if (!adf || typeof adf !== "object") {
+    return null;
+  }
+
+  const parts = [];
+
+  function walk(node) {
+    if (!node) {
+      return;
+    }
+
+    if (Array.isArray(node)) {
+      node.forEach(walk);
+      return;
+    }
+
+    if (node.type === "text" && typeof node.text === "string") {
+      parts.push(node.text);
+    }
+
+    if (node.content) {
+      walk(node.content);
+    }
+  }
+
+  walk(adf);
+
+  return parts.length > 0 ? parts.join(" ") : null;
 }
 
 app.get("/health", (_req, res) => {
@@ -65,12 +112,8 @@ app.get("/health", (_req, res) => {
 
 app.post("/create-jira-issue", async (req, res) => {
   try {
-    if (BACKEND_API_KEY) {
-      const authHeader = req.headers.authorization || "";
-      const expected = `Bearer ${BACKEND_API_KEY}`;
-      if (authHeader !== expected) {
-        return unauthorized(res);
-      }
+    if (!checkBackendAuth(req, res)) {
+      return;
     }
 
     const {
@@ -136,6 +179,172 @@ app.post("/create-jira-issue", async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
+app.get("/jira-issue/:issueKey", async (req, res) => {
+  try {
+    if (!checkBackendAuth(req, res)) {
+      return;
+    }
+
+    const { issueKey } = req.params;
+
+    if (!issueKey) {
+      return res.status(400).json({
+        success: false,
+        error: "issueKey fehlt"
+      });
+    }
+
+    const jiraResponse = await jiraClient.get(`/issue/${issueKey}`);
+
+    const issue = jiraResponse.data;
+    const descriptionText = extractPlainTextFromAdf(issue.fields?.description);
+
+    return res.json({
+      success: true,
+      issueKey: issue.key,
+      issueId: issue.id,
+      summary: issue.fields?.summary || null,
+      description: descriptionText,
+      descriptionRaw: issue.fields?.description || null,
+      status: issue.fields?.status?.name || null,
+      issueType: issue.fields?.issuetype?.name || null,
+      priority: issue.fields?.priority?.name || null,
+      labels: issue.fields?.labels || [],
+      assignee: issue.fields?.assignee
+        ? {
+            accountId: issue.fields.assignee.accountId,
+            displayName: issue.fields.assignee.displayName
+          }
+        : null,
+      browseUrl: `${JIRA_BASE_URL}/browse/${issue.key}`
+    });
+  } catch (error) {
+    const jiraData = error.response?.data;
+    const jiraStatus = error.response?.status;
+
+    console.error("Jira get issue error:", jiraStatus, jiraData || error.message);
+
+    return res.status(500).json({
+      success: false,
+      error: "Jira-Ticket konnte nicht geladen werden",
+      jiraStatus,
+      jiraDetails: jiraData || error.message
+    });
+  }
+});
+
+app.post("/update-jira-issue", async (req, res) => {
+  try {
+    if (!checkBackendAuth(req, res)) {
+      return;
+    }
+
+    const {
+      issueKey,
+      summary,
+      description,
+      priority,
+      labels,
+      assigneeAccountId
+    } = req.body || {};
+
+    if (!issueKey) {
+      return res.status(400).json({
+        success: false,
+        error: "Pflichtfeld fehlt: issueKey"
+      });
+    }
+
+    const fields = {};
+
+    if (summary) {
+      fields.summary = summary;
+    }
+
+    if (description) {
+      fields.description = buildAdfDescription(description);
+    }
+
+    if (priority) {
+      fields.priority = { name: priority };
+    }
+
+    if (Array.isArray(labels)) {
+      fields.labels = labels;
+    }
+
+    if (assigneeAccountId) {
+      fields.assignee = { accountId: assigneeAccountId };
+    }
+
+    if (Object.keys(fields).length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: "Keine Felder zum Aktualisieren übergeben"
+      });
+    }
+
+    await jiraClient.put(`/issue/${issueKey}`, { fields });
+
+    return res.json({
+      success: true,
+      issueKey,
+      browseUrl: `${JIRA_BASE_URL}/browse/${issueKey}`
+    });
+  } catch (error) {
+    const jiraData = error.response?.data;
+    const jiraStatus = error.response?.status;
+
+    console.error("Jira update issue error:", jiraStatus, jiraData || error.message);
+
+    return res.status(500).json({
+      success: false,
+      error: "Jira-Ticket konnte nicht aktualisiert werden",
+      jiraStatus,
+      jiraDetails: jiraData || error.message
+    });
+  }
+});
+
+app.post("/add-jira-comment", async (req, res) => {
+  try {
+    if (!checkBackendAuth(req, res)) {
+      return;
+    }
+
+    const { issueKey, comment } = req.body || {};
+
+    if (!issueKey || !comment) {
+      return res.status(400).json({
+        success: false,
+        error: "Pflichtfelder fehlen: issueKey, comment"
+      });
+    }
+
+    await jiraClient.post(`/issue/${issueKey}/comment`, {
+      body: buildAdfDescription(comment)
+    });
+
+    return res.json({
+      success: true,
+      issueKey,
+      browseUrl: `${JIRA_BASE_URL}/browse/${issueKey}`
+    });
+  } catch (error) {
+    const jiraData = error.response?.data;
+    const jiraStatus = error.response?.status;
+
+    console.error("Jira add comment error:", jiraStatus, jiraData || error.message);
+
+    return res.status(500).json({
+      success: false,
+      error: "Kommentar konnte nicht hinzugefügt werden",
+      jiraStatus,
+      jiraDetails: jiraData || error.message
+    });
+  }
+});
+
+app.listen(PORT, "0.0.0.0", () => {
   console.log(`Server läuft auf Port ${PORT}`);
 });
