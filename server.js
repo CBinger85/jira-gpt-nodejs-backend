@@ -345,6 +345,6 @@ app.post("/add-jira-comment", async (req, res) => {
   }
 });
 
-app.listen(PORT, "0.0.0.0", () => {
+app.listen(PORT, () => {
   console.log(`Server läuft auf Port ${PORT}`);
 });
