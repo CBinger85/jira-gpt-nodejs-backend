@@ -7,7 +7,7 @@ dotenv.config();
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "2mb" }));
 
 const {
   PORT = 3000,
@@ -57,7 +57,7 @@ function checkBackendAuth(req, res) {
   return true;
 }
 
-function buildAdfDescription(text) {
+function buildPlainTextAdf(text) {
   return {
     type: "doc",
     version: 1,
@@ -67,12 +67,37 @@ function buildAdfDescription(text) {
         content: [
           {
             type: "text",
-            text: String(text)
+            text: String(text ?? "")
           }
         ]
       }
     ]
   };
+}
+
+function isValidAdfDocument(value) {
+  return (
+    value &&
+    typeof value === "object" &&
+    value.type === "doc" &&
+    typeof value.version === "number" &&
+    Array.isArray(value.content)
+  );
+}
+
+function normalizeAdfInput({ plainText, adf }) {
+  if (adf !== undefined && adf !== null) {
+    if (!isValidAdfDocument(adf)) {
+      throw new Error("Ungültiges ADF-Dokument");
+    }
+    return adf;
+  }
+
+  if (plainText !== undefined && plainText !== null) {
+    return buildPlainTextAdf(plainText);
+  }
+
+  return null;
 }
 
 function extractPlainTextFromAdf(adf) {
@@ -94,6 +119,10 @@ function extractPlainTextFromAdf(adf) {
 
     if (node.type === "text" && typeof node.text === "string") {
       parts.push(node.text);
+    }
+
+    if (node.type === "emoji" && node.attrs?.text) {
+      parts.push(node.attrs.text);
     }
 
     if (node.content) {
@@ -121,15 +150,28 @@ app.post("/create-jira-issue", async (req, res) => {
       issueType,
       summary,
       description,
+      descriptionAdf,
       priority,
       labels,
       assigneeAccountId
     } = req.body || {};
 
-    if (!projectKey || !issueType || !summary || !description) {
+    if (!projectKey || !issueType || !summary) {
       return res.status(400).json({
         success: false,
-        error: "Pflichtfelder fehlen: projectKey, issueType, summary, description"
+        error: "Pflichtfelder fehlen: projectKey, issueType, summary"
+      });
+    }
+
+    const normalizedDescription = normalizeAdfInput({
+      plainText: description,
+      adf: descriptionAdf
+    });
+
+    if (!normalizedDescription) {
+      return res.status(400).json({
+        success: false,
+        error: "Pflichtfeld fehlt: description oder descriptionAdf"
       });
     }
 
@@ -137,7 +179,7 @@ app.post("/create-jira-issue", async (req, res) => {
       project: { key: projectKey },
       issuetype: { name: issueType },
       summary,
-      description: buildAdfDescription(description)
+      description: normalizedDescription
     };
 
     if (priority) {
@@ -243,6 +285,7 @@ app.post("/update-jira-issue", async (req, res) => {
       issueKey,
       summary,
       description,
+      descriptionAdf,
       priority,
       labels,
       assigneeAccountId
@@ -261,8 +304,11 @@ app.post("/update-jira-issue", async (req, res) => {
       fields.summary = summary;
     }
 
-    if (description) {
-      fields.description = buildAdfDescription(description);
+    if (description !== undefined || descriptionAdf !== undefined) {
+      fields.description = normalizeAdfInput({
+        plainText: description,
+        adf: descriptionAdf
+      });
     }
 
     if (priority) {
@@ -312,17 +358,29 @@ app.post("/add-jira-comment", async (req, res) => {
       return;
     }
 
-    const { issueKey, comment } = req.body || {};
+    const { issueKey, comment, commentAdf } = req.body || {};
 
-    if (!issueKey || !comment) {
+    if (!issueKey) {
       return res.status(400).json({
         success: false,
-        error: "Pflichtfelder fehlen: issueKey, comment"
+        error: "Pflichtfeld fehlt: issueKey"
+      });
+    }
+
+    const normalizedComment = normalizeAdfInput({
+      plainText: comment,
+      adf: commentAdf
+    });
+
+    if (!normalizedComment) {
+      return res.status(400).json({
+        success: false,
+        error: "Pflichtfeld fehlt: comment oder commentAdf"
       });
     }
 
     await jiraClient.post(`/issue/${issueKey}/comment`, {
-      body: buildAdfDescription(comment)
+      body: normalizedComment
     });
 
     return res.json({
